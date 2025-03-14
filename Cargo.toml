@@ -1,0 +1,11 @@
+[package]
+name = "rust-sampler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+opentelemetry = "0.28.0"
+opentelemetry-stdout = "0.28.0"
+opentelemetry_sdk = "0.28.0"
+tokio = { version = "1.44.1", features = ["full"] }
+tokio-tracing = "0.0.0"
