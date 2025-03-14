@@ -14,7 +14,7 @@ use opentelemetry::{
 
 /// DefaultSamplingPrecision is the number of hexadecimal
 /// digits of precision used to expressed the samplling probability.
-const DEFAULT_SAMPLING_PRECISION: i32 = 4;
+const DEFAULT_SAMPLING_PRECISION: u32 = 4;
 
 /// MinSupportedProbability is the smallest probability that
 /// can be encoded by this implementation, and it defines the
@@ -194,11 +194,13 @@ impl GetSamplingIntent for ComposableSampler {
 }
 
 // Threshold
-
 impl Threshold {
     pub fn from(fraction: f64) -> Self {
-	const MAXP: i32 = 14; // maximum precision is 56 bits
-	const DEFP: i32 = DEFAULT_SAMPLING_PRECISION;  // default precision
+	Self::from_with_precision(fraction, DEFAULT_SAMPLING_PRECISION)
+    }
+
+    pub fn from_with_precision(fraction: f64, precision: u32) -> Self {
+	const MAXP: u32 = 14; // maximum precision is 56 bits
 
 	if fraction > MAX_SUPPORTED_PROBABILITY {
 	    return ALWAYS_SAMPLE_THRESHOLD;
@@ -217,8 +219,8 @@ impl Threshold {
 	// We know that `exp <= 0`.  If `exp <= -4`, there will be a
 	// leading hex `f`.  For every multiple of -4, another leading
 	// `f` appears, so this raises precision accordingly.
-	let leading_fs = (fraction.log2() / -4.0).floor() as i32;
-	let precision = std::cmp::min(MAXP, DEFP+leading_fs);
+	let leading_fs = (fraction.log2() / -4.0).floor() as u32;
+	let final_precision = std::cmp::min(MAXP, std::cmp::max(1u32, precision+leading_fs));
 
 	// // Compute the threshold
 	let scaled = (fraction * MAX_ADJUSTED_COUNT as f64).round() as u64;
@@ -226,7 +228,7 @@ impl Threshold {
 
 	// Round to the specified precision, if less than the maximum.
 	// Here, 4 is the number of bits per hex digit.
-	let shift = 4 * (MAXP - precision);
+	let shift = 4 * (MAXP - final_precision);
 	if shift != 0 {
 	    let half = 1u64 << (shift - 1);
 	    threshold += half;
@@ -280,5 +282,17 @@ mod tests {
 	assert_eq!(Threshold::from(0.25).to_string(), "c");
 	assert_eq!(Threshold::from(0.01).to_string(), "fd70a");
 	assert_eq!(Threshold::from(MIN_SUPPORTED_PROBABILITY).to_string(), "ffffffffffffff");
+
+	assert_eq!(NEVER_SAMPLE_THRESHOLD.to_string(), "never_sampled");
+	assert_eq!(Threshold(MAX_ADJUSTED_COUNT).to_string(), "never_sampled");
+	assert_eq!(Threshold(u64::MAX).to_string(), "never_sampled");
+
+	assert_eq!(Threshold::from_with_precision(1f64/3f64, 14).to_string(), "aaaaaaaaaaaaac");
+	assert_eq!(Threshold::from_with_precision(1f64/3f64, 10).to_string(), "aaaaaaaaab");
+	assert_eq!(Threshold::from_with_precision(1f64/3f64, 2).to_string(), "ab");
+	assert_eq!(Threshold::from_with_precision(1f64/3f64, 1).to_string(), "b");
+
+	assert_eq!(Threshold::from_with_precision(0.01, 8).to_string(), "fd70a3d71");
+	assert_eq!(Threshold::from_with_precision(0.99, 8).to_string(), "028f5c29");
     }
 }
