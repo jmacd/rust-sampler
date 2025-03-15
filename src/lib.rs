@@ -1,11 +1,17 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Nit: why doesn't OTel-Rust use copyright headers?
 use opentelemetry::{
     trace::{
         Link,
 	SamplingDecision,
 	SamplingResult,
+	SpanContext,
 	SpanKind,
 	TraceId,
 	TraceState,
+	TraceContextExt,
     },
     Context, KeyValue,
 };
@@ -16,47 +22,48 @@ use opentelemetry::{
 /// digits of precision used to expressed the samplling probability.
 const DEFAULT_SAMPLING_PRECISION: u32 = 4;
 
-/// MinSupportedProbability is the smallest probability that
-/// can be encoded by this implementation, and it defines the
-/// smallest interval between probabilities across the range.
-/// The largest supported probability is (1-MinSupportedProbability).
+/// OTEP 235 limits precision to 56 bits.
+const MAX_SAMPLING_PRECISION: u32 = 14;
+
+/// This is the smallest probability that can be encoded by this
+/// implementation, and it defines the smallest interval between
+/// probabilities across the range.  The largest supported probability
+/// is (1-MinSupportedProbability).
 ///
 /// This value corresponds with the size of a float64
 /// significand, because it simplifies this implementation to
 /// restrict the probability to use 52 bits (vs 56 bits).
 const MIN_SUPPORTED_PROBABILITY: f64 = 1f64 / (MAX_ADJUSTED_COUNT as f64);
 
-// maxSupportedProbability is the number closest to 1.0 (i.e.,
-// near 99.999999%) that is not equal to 1.0 in terms of the
-// float64 representation, having 52 bits of significand.
-// Other ways to express this number:
-//
-//   0x1.ffffffffffffe0p-01
-//   0x0.fffffffffffff0p+00
-//   math.Nextafter(1.0, 0.0)
+/// This is the number closest to 1.0 (i.e., near 99.999999%) that is
+/// not equal to 1.0 in terms of the float64 representation, having 52
+/// bits of significand.  Other ways to express this number:
+///
+///   0x1.ffffffffffffe0p-01
+///   0x0.fffffffffffff0p+00
+///   math.Nextafter(1.0, 0.0)
 const MAX_SUPPORTED_PROBABILITY: f64 = 1f64 - (1f64 / ((1u64<<52) as f64));
 
-// maxAdjustedCount is the inverse of the smallest
-// representable sampling probability, it is the number of
-// distinct 56 bit values.
+/// This is the inverse of the smallest representable sampling
+/// probability, it is the number of distinct 56 bit values.
 const MAX_ADJUSTED_COUNT: u64 = 1u64 << 56;
 
-// randomnessMask is a mask that selects the least-significant
-// 56 bits of a uint64.
-//const RANDOMNESS_MASK: u64 = MAX_ADJUSTED_COUNT - 1;
-
-// NEVER_SAMPLE_THRESHOLD indicates a span that should not be sampled.
-// This is equivalent to sampling with 0% probability.
+/// This indicates a span that should not be sampled.  This is
+/// equivalent to sampling with 0% probability.
 const NEVER_SAMPLE_THRESHOLD: Threshold = Threshold(1u64<<56);
 
-// ALWAYS_SAMPLE_THREHSOLD indicates to sample with 100% probability.
+/// This indicates to sample with 100% probability.
 const ALWAYS_SAMPLE_THRESHOLD: Threshold = Threshold(0);
 
 /// Threshold is computed from TraceState fields and/or f64 values.
 /// As in OTEP 235, the 0 value means rejecting 0 spans.
 /// The value must be <= NEVER_SAMPLE_THRESHOLD.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Threshold(u64);
+
+/// Randomness is computed from TraceState and/or TraceID values.
+#[derive(Clone, PartialEq)]
+pub struct Randomness(u64);
 
 /// A ComposableSampler implements the built-in composable samplers.
 /// GetSamplingIntent is implemented for these according to OTEP 4321.
@@ -64,20 +71,37 @@ pub struct Threshold(u64);
 pub enum ComposableSampler {
     AlwaysOn,
     AlwaysOff,
-    //Annotating,
-    ParentThreshold,
-    RuleBased,
     TraceIdRatio(Threshold),
+    ParentThreshold,
+    // RuleBased,
+    //Annotating,
 }
 
 /// SamplingIntent is an individual part in a composable decision.
 pub struct SamplingIntent {
-	threshold:         Threshold,          // i.e., sampling probability, implies record & export when...
-	threshold_reliable: bool,           // whether the threshold is reliable
+	threshold:         Option<Threshold>,
 
 	// TODO
 	//Attributes        AttributesFunc // add attributes the span
 	//TraceState        TraceStateFunc // update the tracestate
+}
+
+/// Parameters are the arguments to GetSamplingIntent.
+#[allow(unused)]
+pub struct Parameters<'a> {
+    parent_context: Option<&'a Context>,
+    trace_id: TraceId,
+    name: &'a str,
+    span_kind: &'a SpanKind,
+    attributes: &'a [KeyValue],
+    links: &'a [Link],
+}
+
+#[allow(unused)]
+pub struct ComposableParameters<'a> {
+    params: &'a Parameters<'a>,
+    parent_span_context: Option<&'a SpanContext>,
+    parent_threshold: Option<Threshold>,
 }
 
 /// A CompositeSampler implements the original ShouldSample interface
@@ -93,16 +117,11 @@ pub struct CompositeSampler {
 pub trait GetSamplingIntent: CloneGetSamplingIntent + Send + Sync + std::fmt::Debug {
     fn get_sampling_intent(
         &self,
-	_parent_context: Option<&Context>,
-        _trace_id: TraceId,
-        _name: &str,
-        _span_kind: &SpanKind,
-        _attributes: &[KeyValue],
-        _links: &[Link],
+	params: &ComposableParameters<'_>,
     ) -> SamplingIntent;
 }
 
-/// This trait should not be used directly instead users should use [`GetSamplingIntent`].
+/// This trait supports cloning Box<dyn GetSamplingIntent>.
 pub trait CloneGetSamplingIntent {
     fn box_clone(&self) -> Box<dyn GetSamplingIntent>;
 }
@@ -135,16 +154,150 @@ impl CompositeSampler {
 impl opentelemetry_sdk::trace::ShouldSample for CompositeSampler {
     fn should_sample(
         &self,
-	_parent_context: Option<&Context>,
-        _trace_id: TraceId,
-        _name: &str,
-        _span_kind: &SpanKind,
-        _attributes: &[KeyValue],
-        _links: &[Link],
+	parent_context: Option<&Context>,
+        trace_id: TraceId,
+        name: &str,
+        span_kind: &SpanKind,
+        attributes: &[KeyValue],
+        links: &[Link],
     ) -> SamplingResult {
+	let params = Parameters{
+	    parent_context,
+	    trace_id,
+	    name,
+	    span_kind,
+	    attributes,
+	    links,
+	};
 
+        parent_context
+                .filter(|cx| cx.has_active_span())
+                .map_or_else(
+                    || {
+			self.should_sample_parent(
+			    &params,
+			    None,
+			)
+                    },
+                    |ctx| {
+                        let span = ctx.span();
+                        let parent_span_context = span.span_context();
+
+			self.should_sample_parent(
+			    &params,
+			    Some(parent_span_context),
+			)
+                    },
+                )
+    }
+}
+
+impl CompositeSampler {
+    fn should_sample_parent(
+        &self,
+	params: &Parameters<'_>,
+	parent_span_context: Option<&SpanContext>,
+    ) -> SamplingResult {
+	parent_span_context.map_or_else(
+	    || self.should_sample_otts(params, parent_span_context, None),
+	    |sctx| self.should_sample_otts(params, parent_span_context, sctx.trace_state().get("ot")),
+	)
+    }
+    
+    fn should_sample_otts(
+        &self,
+	params: &Parameters<'_>,
+	parent_span_context: Option<&SpanContext>,
+	otts_str: Option<&str>,
+    ) -> SamplingResult {
+	// Note: I added TraceState::from_str_delimited() for this
+	// purpose: would be more proper to add a new types
+	// representing the two level of trace state.
+	let otts = otts_str.map(|s| TraceState::from_str_delimited(s, ':', ';').ok()).flatten();
+
+	let rv_value = otts.as_ref().map(|ts| ts.get("rv")).flatten();
+	let th_value = otts.as_ref().map(|ts| ts.get("th")).flatten();
+
+	let randomness = rv_value.map(
+	    |rv| Randomness::from_rv_value(rv),
+	).flatten().or_else(
+	    || Some(Randomness::from_trace_id(params.trace_id)),
+	).unwrap();
+
+	let threshold = th_value.map(
+	    |th| Threshold::from_th_value(th),
+	).flatten();
+
+	self.should_sample_randomness_threshold(
+	    params,
+	    parent_span_context,
+	    randomness,
+	    threshold,
+	)
+    }
+
+    fn should_sample_randomness_threshold(
+        &self,
+	params: &Parameters<'_>,
+	parent_span_context: Option<&SpanContext>,
+	randomness: Randomness,
+	mut parent_threshold: Option<Threshold>,
+    ) -> SamplingResult {
+	let mut update_trace_flag = false;
+	let mut erase_threshold = false;
+	let mut threshold_reliable = false;
+
+	let flag_sampled = parent_span_context
+	    .map(|psc| psc.is_sampled())
+	    .or_else(|| Some(false))
+	    .unwrap();
+	
+	if let Some(parent_threshold) = parent_threshold.as_ref() {
+	    let threshold_sampled = parent_threshold.0 <= randomness.0;
+
+	    match (threshold_sampled, flag_sampled) {
+		(true, true) => {
+		    // The two agree to sample.  Threshold is reliable.
+		    threshold_reliable = true;
+		},
+		(true, false) => {
+		    // Threshold says sampled, flag says not.
+		    update_trace_flag = true;
+		},
+		(false, true) => {
+		    // Flag says sampled, threshold says not.  The threshold should not propagate.
+		    erase_threshold = true;
+		},
+		(false, false) => {
+		    // The two agree not to sample.  The threshold should not propagate.
+		    erase_threshold = true;
+		}			
+	    }
+	}
+	if !threshold_reliable {
+	    parent_threshold = None;
+	}
+
+	let cparams = ComposableParameters{
+	    params,
+	    parent_span_context,
+	    parent_threshold,
+	};
+	let intent = self.sampler.get_sampling_intent(&cparams);
+
+	let sampled = intent.threshold.map(|th| th.0 <= randomness.0).or(Some(false)).unwrap();
+
+	// TODO: recombine tracestate; evaluate attributes funcs.
+	(_, _) = (update_trace_flag, erase_threshold);
+	
+	let decision = if sampled {
+	    SamplingDecision::RecordAndSample
+	} else {
+	    SamplingDecision::Drop
+	};
+	
 	SamplingResult {
-	    decision: SamplingDecision::RecordAndSample,
+	    decision: decision,
 	    attributes: vec![],
 	    trace_state: TraceState::default(),
 	}
@@ -156,52 +309,39 @@ impl opentelemetry_sdk::trace::ShouldSample for CompositeSampler {
 impl GetSamplingIntent for ComposableSampler {
     fn get_sampling_intent(
         &self,
-	_parent_context: Option<&Context>,
-        _trace_id: TraceId,
-        _name: &str,
-        _span_kind: &SpanKind,
-        _attributes: &[KeyValue],
-        _links: &[Link],
+	params: &ComposableParameters<'_>,
     ) -> SamplingIntent {
         match self {
-            // Always sample the trace
             ComposableSampler::AlwaysOn => SamplingIntent {
-		threshold: ALWAYS_SAMPLE_THRESHOLD,
-		threshold_reliable: true,
+		threshold: Some(ALWAYS_SAMPLE_THRESHOLD),
 	    },
             ComposableSampler::AlwaysOff => SamplingIntent {
-		threshold: NEVER_SAMPLE_THRESHOLD,
-		threshold_reliable: false,
+		threshold: None,
 	    },
             ComposableSampler::TraceIdRatio(threshold) => SamplingIntent {
-		threshold: threshold.clone(),
-		threshold_reliable: true,
+		threshold: Some(threshold.clone()),
 	    },
-            // ComposableSampler::Annotating => SamplingIntent {
-	    // 	threshold: NEVER_SAMPLE_THRESHOLD,
-	    // 	threshold_reliable: false,
-	    // },
             ComposableSampler::ParentThreshold => SamplingIntent {
-		threshold: NEVER_SAMPLE_THRESHOLD,
-		threshold_reliable: false,
+		threshold: params.parent_threshold.clone(),
 	    },
-            ComposableSampler::RuleBased => SamplingIntent {
-		threshold: NEVER_SAMPLE_THRESHOLD,
-		threshold_reliable: false,
-	    },
+            // ComposableSampler::RuleBased => SamplingIntent {
+	    // 	threshold: None,
+	    // },
+            // ComposableSampler::Annotating => SamplingIntent {
+	    // 	threshold: None,
+	    // },
 	}
     }    
 }
 
 // Threshold
+
 impl Threshold {
     pub fn from(fraction: f64) -> Self {
 	Self::from_with_precision(fraction, DEFAULT_SAMPLING_PRECISION)
     }
 
     pub fn from_with_precision(fraction: f64, precision: u32) -> Self {
-	const MAXP: u32 = 14; // maximum precision is 56 bits
-
 	if fraction > MAX_SUPPORTED_PROBABILITY {
 	    return ALWAYS_SAMPLE_THRESHOLD;
 	}
@@ -220,7 +360,8 @@ impl Threshold {
 	// leading hex `f`.  For every multiple of -4, another leading
 	// `f` appears, so this raises precision accordingly.
 	let leading_fs = (fraction.log2() / -4.0).floor() as u32;
-	let final_precision = std::cmp::min(MAXP, std::cmp::max(1u32, precision+leading_fs));
+	let final_precision = std::cmp::min(MAX_SAMPLING_PRECISION,
+					    std::cmp::max(1u32, precision+leading_fs));
 
 	// // Compute the threshold
 	let scaled = (fraction * MAX_ADJUSTED_COUNT as f64).round() as u64;
@@ -228,19 +369,77 @@ impl Threshold {
 
 	// Round to the specified precision, if less than the maximum.
 	// Here, 4 is the number of bits per hex digit.
-	let shift = 4 * (MAXP - final_precision);
+	let shift = 4 * (MAX_SAMPLING_PRECISION - final_precision);
 	if shift != 0 {
 	    let half = 1u64 << (shift - 1);
 	    threshold += half;
 	    threshold >>= shift;
 	    threshold <<= shift;
 	}
-	Threshold(threshold)
+	Self(threshold)
+    }
+
+    /// Extracts a threshold from an OTel tracestate 'th' value.
+    pub fn from_th_value(th: &str) -> Option<Self> {
+	if th.len() == 0 || th.len() > MAX_SAMPLING_PRECISION as usize {
+	    None
+	} else {
+	    u64::from_str_radix(th, 16).ok().map(|x| {
+		let shift = (MAX_SAMPLING_PRECISION as usize - th.len())*4;
+		Threshold(x << shift)
+	    })
+	}
     }
 
     pub fn to_string(&self) -> String {
 	format!("{:?}", self)
     }
+}
+
+// Randomness
+
+impl Randomness {
+    /// Extracts the least-significant 56 bits of the TraceId.
+    pub fn from_trace_id(tid: TraceId) -> Randomness {
+	// Note there's no way to access the u128 underneath, otherwise
+	// this could be an arithmetic expression,
+	//
+	//  u64::from(tid.to_u128()) & (MAX_ADJUSTED_COUNT - 1)
+	//
+	// i.e., (trace_id & 0xffffffffffffff) as u64.
+	let by16 = tid.to_bytes();
+	Randomness(u64::from_be_bytes([
+	    0,
+	    by16[9], 
+	    by16[10], 
+	    by16[11], 
+	    by16[12], 
+	    by16[13],
+	    by16[14], 
+	    by16[15],
+	]))
+    }
+
+    /// Extracts explicit randomness, expecting exactly 14 hex digits.
+    pub fn from_rv_value(rv: &str) -> Option<Randomness> {
+	// Use explicit randomness.
+	if rv.len() != MAX_SAMPLING_PRECISION as usize {
+	    None
+	} else {
+	    u64::from_str_radix(rv, 16).ok().map(|x| Randomness(x))
+	}
+    }
+
+}
+
+// fmt::Debug
+
+impl std::fmt::Debug for Randomness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+	let x = MAX_ADJUSTED_COUNT + self.0;
+	let xtra = format!("{:x}", x);
+	f.write_str(xtra.as_str().strip_prefix("1").unwrap())
+    }    
 }
 
 impl std::fmt::Debug for Threshold {
@@ -273,6 +472,10 @@ impl std::fmt::Debug for Threshold {
 mod tests {
     use super::*;
 
+    // Note: this package makes testing threshold encodings natural.
+    // because both use hexadecimal encoding.
+    use hexf::hexf64;
+
     #[test]
     fn threshold_to_string() {
 	assert_eq!(ALWAYS_SAMPLE_THRESHOLD.to_string(), "0");
@@ -282,7 +485,7 @@ mod tests {
 	assert_eq!(Threshold::from(0.25).to_string(), "c");
 	assert_eq!(Threshold::from(0.01).to_string(), "fd70a");
 	assert_eq!(Threshold::from(MIN_SUPPORTED_PROBABILITY).to_string(), "ffffffffffffff");
-
+	
 	assert_eq!(NEVER_SAMPLE_THRESHOLD.to_string(), "never_sampled");
 	assert_eq!(Threshold(MAX_ADJUSTED_COUNT).to_string(), "never_sampled");
 	assert_eq!(Threshold(u64::MAX).to_string(), "never_sampled");
@@ -295,4 +498,99 @@ mod tests {
 	assert_eq!(Threshold::from_with_precision(0.01, 8).to_string(), "fd70a3d71");
 	assert_eq!(Threshold::from_with_precision(0.99, 8).to_string(), "028f5c29");
     }
+
+    /// Inspired by tests in
+    /// https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/pkg/sampling
+    #[test]
+    fn threshold_exhaustive() {
+	struct Case {
+	    prob: f64,
+	    exact: &'static str,
+	    rounded: Vec<&'static str>,
+	}
+
+	// Note: the tests below express the threshold in terms of
+	// (1 - hex_fraction), so the hexadecimal form of the fraction
+	// equals the rejection threshold exactly. This tests for
+	// correct rounding.
+	let cases = [Case{
+	    prob: 1.0 - hexf64!("0x456789ap-28"),
+	    exact: "456789a",
+	    rounded: vec![
+		"456789a",
+		"45678a",
+		"45679",
+		"4568",
+		"456",
+		"45",
+		"4",
+	    ],
+	}, Case{
+	    prob: 1.0 - hexf64!("0xfff1f2e3d4c5p-48"),
+	    exact: "fff1f2e3d4c5",
+	    rounded: vec![
+		"fff1f2e3d4c",
+		"fff1f2e3d5",
+		"fff1f2e3d",
+		"fff1f2e4",
+		"fff1f2e",
+		"fff1f3",
+		"fff2",
+		"fff",
+		// Note: threshold will not lower precision at this
+		// point, because we lose orders of magnitude for very
+		// small probabilities..
+	    ],
+	}, Case{
+	    prob: 1.0 - hexf64!("0x0001f2e3d4c5bp-52"),
+	    exact: "0001f2e3d4c5b",
+	    rounded: vec![
+		"0001f2e3d4c5b",
+		"0001f2e3d4c6",
+		"0001f2e3d4c",
+		"0001f2e3d5",
+		"0001f2e3d",
+		"0001f2e4",
+		"0001f2e",
+		"0001f3",
+		"0001f",
+		"0002",
+		// Note: collapse to 100% sampling is allowed.
+		"0",
+	    ],
+	}];
+
+	for k in cases {
+	    assert_eq!(Threshold::from_with_precision(k.prob, MAX_SAMPLING_PRECISION).to_string(),
+		       k.exact);
+
+	    // Ignore leading 'f', they are not counted in precision.
+	    let mut stripped = k.exact;
+	    while let Some(s) = stripped.strip_prefix("f") {
+		stripped = s;
+	    }
+
+	    let leading_fs = k.exact.len() - stripped.len();
+
+	    for round in k.rounded {
+		// Check that the input is not shorter than the number
+		// of leading Fs, the test will fail b/c zero precision.
+		assert!(round.len() >= leading_fs);
+
+		let prec = (round.len() - leading_fs) as u32;
+
+		let rth = Threshold::from_with_precision(k.prob, prec);
+
+		assert_eq!(rth.to_string(), round);
+	    }
+	}
+    }
+
+    #[test]
+    fn trace_id_to_randomness() {
+	let tid = opentelemetry::trace::TraceId::from_u128(0x101010101010101010123456789abcde);
+
+	assert_eq!(Some(Randomness::from_trace_id(tid)), Randomness::from_rv_value("123456789abcde"));
+    }
 }
+
