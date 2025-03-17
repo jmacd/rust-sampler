@@ -65,6 +65,43 @@ pub struct Threshold(u64);
 #[derive(Clone, PartialEq)]
 pub struct Randomness(u64);
 
+/// AttributesProvider is a trait for providing attributes in a sampling decision
+pub trait AttributesProvider: AttributesProviderClone + Send + Sync + std::fmt::Debug {
+    fn get_attributes(&self) -> Vec<KeyValue>;
+}
+
+/// This trait supports cloning Box<dyn AttributesProvider>
+pub trait AttributesProviderClone {
+    fn box_clone(&self) -> Box<dyn AttributesProvider>;
+}
+
+impl<T> AttributesProviderClone for T
+where
+    T: AttributesProvider + Clone + 'static,
+{
+    fn box_clone(&self) -> Box<dyn AttributesProvider> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn AttributesProvider> {
+    fn clone(&self) -> Self {
+        self.box_clone()
+    }
+}
+
+/// A simple implementation of AttributesProvider that returns a fixed list of attributes
+#[derive(Debug, Clone)]
+pub struct StaticAttributesProvider {
+    attributes: Vec<KeyValue>,
+}
+
+impl AttributesProvider for StaticAttributesProvider {
+    fn get_attributes(&self) -> Vec<KeyValue> {
+        self.attributes.clone()
+    }
+}
+
 /// A ComposableSampler implements the built-in composable samplers.
 /// GetSamplingIntent is implemented for these according to OTEP 4321.
 #[derive(Debug, Clone)]
@@ -74,18 +111,13 @@ pub enum ComposableSampler {
     TraceIdRatio(Threshold),
     ParentThreshold,
     RuleBased(Vec<RuleAndPredicate>),
-
-    // TODO
-    //Annotating,
+    Annotating(Box<dyn AttributesProvider>, Box<dyn GetSamplingIntent>),
 }
 
 /// SamplingIntent is an individual part in a composable decision.
 pub struct SamplingIntent {
 	threshold:         Option<Threshold>,
-
-	// TODO
-	//Attributes        AttributesFunc // add attributes the span
-	//TraceState        TraceStateFunc // update the tracestate
+    attributes_provider: Option<Box<dyn AttributesProvider>>,
 }
 
 /// Parameters are the arguments to GetSamplingIntent.
@@ -298,11 +330,34 @@ impl CompositeSampler {
 	    SamplingDecision::Drop
 	};
 
+	// Only collect attributes if we're sampling this span
+    let attributes = if sampled && intent.attributes_provider.is_some() {
+        intent.attributes_provider.get_attributes()
+    } else {
+        vec![]
+    };
+
 	SamplingResult {
 	    decision: decision,
-	    attributes: vec![],
+	    attributes,
 	    trace_state: TraceState::default(),
 	}
+    }
+}
+
+// A combined attributes provider that merges attributes from multiple providers
+#[derive(Debug, Clone)]
+struct CombinedAttributesProvider {
+    providers: Vec<Box<dyn AttributesProvider>>,
+}
+
+impl AttributesProvider for CombinedAttributesProvider {
+    fn get_attributes(&self) -> Vec<KeyValue> {
+        let mut result = Vec::new();
+        for provider in &self.providers {
+            result.extend(provider.get_attributes());
+        }
+        result
     }
 }
 
@@ -316,15 +371,19 @@ impl GetSamplingIntent for ComposableSampler {
         match self {
             ComposableSampler::AlwaysOn => SamplingIntent {
 		threshold: Some(ALWAYS_SAMPLE_THRESHOLD),
+        attributes_provider: None,
 	    },
             ComposableSampler::AlwaysOff => SamplingIntent {
 		threshold: None,
+        attributes_provider: None,
 	    },
             ComposableSampler::TraceIdRatio(threshold) => SamplingIntent {
 		threshold: Some(threshold.clone()),
+        attributes_provider: None,
 	    },
             ComposableSampler::ParentThreshold => SamplingIntent {
 		threshold: params.parent_threshold.clone(),
+        attributes_provider: None,
 	    },
             ComposableSampler::RuleBased(rules) => {
                 // Evaluate rules in order
@@ -336,6 +395,26 @@ impl GetSamplingIntent for ComposableSampler {
                 // Default case when no rules match
                 SamplingIntent {
                     threshold: None,
+                    attributes_provider: None,
+                }
+            },
+            ComposableSampler::Annotating(provider, delegate) => {
+                let delegate_intent = delegate.get_sampling_intent(params);
+
+                // Create a combined attributes provider if delegate has attributes,
+                // otherwise just use our provider
+                let attributes_provider = if let Some(delegate_provider) = delegate_intent.attributes_provider {
+                    Some(Box::new(CombinedAttributesProvider {
+                        providers: vec![delegate_provider, provider.clone()],
+                    }) as Box<dyn AttributesProvider>)
+                } else {
+                    Some(provider.clone())
+                };
+
+                // Use the delegate's threshold
+                SamplingIntent {
+                    threshold: delegate_intent.threshold,
+                    attributes_provider,
                 }
             },
 	}
@@ -702,6 +781,19 @@ pub fn is_local_predicate() -> Box<dyn Predicate> {
     Box::new(IsLocalPredicate {})
 }
 
+// Helper function to create an annotating sampler
+pub fn annotating_sampler(attributes: Vec<KeyValue>, delegate: Box<dyn GetSamplingIntent>) -> ComposableSampler {
+    ComposableSampler::Annotating(
+        Box::new(StaticAttributesProvider { attributes }),
+        delegate
+    )
+}
+
+// Helper function to create a simple always-on annotating sampler
+pub fn always_on_with_attributes(attributes: Vec<KeyValue>) -> ComposableSampler {
+    annotating_sampler(attributes, Box::new(ComposableSampler::AlwaysOn))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +855,7 @@ mod tests {
 	    prob: 1.0 - hexf64!("0xfff1f2e3d4c5p-48"),
 	    exact: "fff1f2e3d4c5",
 	    rounded: vec![
+		"fff1f2e3d4c5",
 		"fff1f2e3d4c",
 		"fff1f2e3d5",
 		"fff1f2e3d",
