@@ -203,7 +203,7 @@ impl CompositeSampler {
 	    |sctx| self.should_sample_otts(params, parent_span_context, sctx.trace_state().get("ot")),
 	)
     }
-    
+
     fn should_sample_otts(
         &self,
 	params: &Parameters<'_>,
@@ -251,7 +251,7 @@ impl CompositeSampler {
 	    .map(|psc| psc.is_sampled())
 	    .or_else(|| Some(false))
 	    .unwrap();
-	
+
 	if let Some(parent_threshold) = parent_threshold.as_ref() {
 	    let threshold_sampled = parent_threshold.0 <= randomness.0;
 
@@ -271,7 +271,7 @@ impl CompositeSampler {
 		(false, false) => {
 		    // The two agree not to sample.  The threshold should not propagate.
 		    erase_threshold = true;
-		}			
+		}
 	    }
 	}
 	if !threshold_reliable {
@@ -289,13 +289,13 @@ impl CompositeSampler {
 
 	// TODO: recombine tracestate; evaluate attributes funcs.
 	(_, _) = (update_trace_flag, erase_threshold);
-	
+
 	let decision = if sampled {
 	    SamplingDecision::RecordAndSample
 	} else {
 	    SamplingDecision::Drop
 	};
-	
+
 	SamplingResult {
 	    decision: decision,
 	    attributes: vec![],
@@ -325,13 +325,13 @@ impl GetSamplingIntent for ComposableSampler {
 		threshold: params.parent_threshold.clone(),
 	    },
             ComposableSampler::RuleBased => SamplingIntent {
-	     	threshold: Some(),
+	     	threshold: Some(NEVER_SAMPLE_THRESHOLD),
 	    },
             // ComposableSampler::Annotating => SamplingIntent {
 	    // 	threshold: None,
 	    // },
 	}
-    }    
+    }
 }
 
 // Threshold
@@ -410,12 +410,12 @@ impl Randomness {
 	let by16 = tid.to_bytes();
 	Randomness(u64::from_be_bytes([
 	    0,
-	    by16[9], 
-	    by16[10], 
-	    by16[11], 
-	    by16[12], 
+	    by16[9],
+	    by16[10],
+	    by16[11],
+	    by16[12],
 	    by16[13],
-	    by16[14], 
+	    by16[14],
 	    by16[15],
 	]))
     }
@@ -439,7 +439,7 @@ impl std::fmt::Debug for Randomness {
 	let x = MAX_ADJUSTED_COUNT + self.0;
 	let xtra = format!("{:x}", x);
 	f.write_str(xtra.as_str().strip_prefix("1").unwrap())
-    }    
+    }
 }
 
 impl std::fmt::Debug for Threshold {
@@ -465,76 +465,187 @@ impl std::fmt::Debug for Threshold {
 	    let s = std::str::from_utf8(t).unwrap();
 	    f.write_str(s)
 	}
-    }    
+    }
 }
 
-// RuleBased
-
-func RuleBased(options ...RuleBasedOption) ComposableSampler {
-	rbc := &ruleBasedConfig{}
-	for _, opt := range options {
-		opt(rbc)
-	}
-	if rbc.defRule != nil {
-		rbc.rules = append(rbc.rules, ruleAndPredicate{
-			Predicate:         TruePredicate(),
-			ComposableSampler: rbc.defRule,
-		})
-	}
-	return ruleBased(rbc.rules)
+// Predicate trait for rule-based sampling decisions
+pub trait Predicate: PredicateClone + Send + Sync + std::fmt::Debug {
+    fn decide(&self, params: &ComposableParameters<'_>) -> bool;
+    fn description(&self) -> String;
 }
 
-type ruleAndPredicate struct {
-	Predicate
-	ComposableSampler
+// Helper trait for cloning boxed Predicates
+pub trait PredicateClone {
+    fn box_clone(&self) -> Box<dyn Predicate>;
 }
 
-type ruleBasedConfig struct {
-	rules   []ruleAndPredicate
-	defRule ComposableSampler
+impl<T> PredicateClone for T
+where
+    T: Predicate + Clone + 'static,
+{
+    fn box_clone(&self) -> Box<dyn Predicate> {
+        Box::new(self.clone())
+    }
 }
 
-type ruleBased []ruleAndPredicate
-
-var _ ComposableSampler = &ruleBased{}
-
-// Description implements ComposableSampler.
-func (rb ruleBased) Description() string {
-	return fmt.Sprintf("RuleBased{%s}",
-		strings.Join(func(rules []ruleAndPredicate) (desc []string) {
-			for _, rule := range rules {
-				desc = append(desc,
-					fmt.Sprintf("rule(%s)=%s",
-						rule.Predicate.Description(),
-						rule.ComposableSampler.Description(),
-					),
-				)
-			}
-			return
-		}(rb), ","))
+impl Clone for Box<dyn Predicate> {
+    fn clone(&self) -> Self {
+        self.box_clone()
+    }
 }
 
-// GetSamplingIntent implements ComposableSampler.
-func (rb ruleBased) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
-	for _, rule := range rb {
-		if rule.Decide(params) {
-			return rule.ComposableSampler.GetSamplingIntent(params)
-		}
-	}
+// A simple predicate that always returns true
+#[derive(Debug, Clone)]
+pub struct TruePredicate {}
 
-	// When no rules match.  This will not happen when there is a
-	// default rule set.
-	return SamplingIntent{
-		Threshold: NEVER_SAMPLE_THRESHOLD,
-	}
+impl Predicate for TruePredicate {
+    fn decide(&self, _params: &ComposableParameters<'_>) -> bool {
+        true
+    }
+
+    fn description(&self) -> String {
+        "true".to_string()
+    }
 }
 
-// ComposableParentBased combines a root sampler and a ParentThreshold.
-func ComposableParentBased(root ComposableSampler) ComposableSampler {
-	return RuleBased(
-		WithRule(IsRootPredicate(), root),
-		WithDefaultRule(ParentThreshold()),
-	)
+// A predicate that checks if the span is a root span
+#[derive(Debug, Clone)]
+pub struct IsRootPredicate {}
+
+impl Predicate for IsRootPredicate {
+    fn decide(&self, params: &ComposableParameters<'_>) -> bool {
+        params.parent_span_context.is_none()
+    }
+
+    fn description(&self) -> String {
+        "is_root".to_string()
+    }
+}
+
+// Options for configuring RuleBased sampler
+pub struct RuleBasedOption(Box<dyn Fn(&mut RuleBasedConfig)>);
+
+// A rule paired with a predicate
+#[derive(Clone, Debug)]
+pub struct RuleAndPredicate {
+    predicate: Box<dyn Predicate>,
+    sampler: Box<dyn GetSamplingIntent>,
+}
+
+// Configuration for RuleBased sampler
+#[derive(Default, Clone)]
+pub struct RuleBasedConfig {
+    rules: Vec<RuleAndPredicate>,
+    default_rule: Option<Box<dyn GetSamplingIntent>>,
+}
+
+// RuleBased sampler implements rule-based sampling
+#[derive(Clone, Debug)]
+pub struct RuleBased {
+    rules: Vec<RuleAndPredicate>,
+}
+
+// Helper functions to create predicates
+pub fn true_predicate() -> Box<dyn Predicate> {
+    Box::new(TruePredicate {})
+}
+
+pub fn is_root_predicate() -> Box<dyn Predicate> {
+    Box::new(IsRootPredicate {})
+}
+
+// Configuration options for RuleBased sampler
+pub fn with_rule(
+    predicate: Box<dyn Predicate>,
+    sampler: Box<dyn GetSamplingIntent>,
+) -> RuleBasedOption {
+    RuleBasedOption(Box::new(move |config: &mut RuleBasedConfig| {
+        config.rules.push(RuleAndPredicate {
+            predicate: predicate.clone(),
+            sampler: sampler.clone(),
+        });
+    }))
+}
+
+pub fn with_default_rule(sampler: Box<dyn GetSamplingIntent>) -> RuleBasedOption {
+    RuleBasedOption(Box::new(move |config: &mut RuleBasedConfig| {
+        config.default_rule = Some(sampler.clone());
+    }))
+}
+
+// Create a new RuleBased sampler
+pub fn rule_based(options: Vec<RuleBasedOption>) -> ComposableSampler {
+    let mut config = RuleBasedConfig::default();
+
+    for option in options {
+        (option.0)(&mut config);
+    }
+
+    if let Some(default_rule) = config.default_rule {
+        config.rules.push(RuleAndPredicate {
+            predicate: true_predicate(),
+            sampler: default_rule,
+        });
+    }
+
+    ComposableSampler::RuleBased
+}
+
+// Implement GetSamplingIntent for RuleBased
+impl GetSamplingIntent for RuleBased {
+    fn get_sampling_intent(
+        &self,
+        params: &ComposableParameters<'_>,
+    ) -> SamplingIntent {
+        for rule in &self.rules {
+            if rule.predicate.decide(params) {
+                return rule.sampler.get_sampling_intent(params);
+            }
+        }
+
+        // When no rules match
+        SamplingIntent {
+            threshold: Some(NEVER_SAMPLE_THRESHOLD),
+        }
+    }
+}
+
+// Create a parent-based composable sampler
+pub fn composable_parent_based(root: Box<dyn GetSamplingIntent>) -> ComposableSampler {
+    rule_based(vec![
+        with_rule(is_root_predicate(), root),
+        with_default_rule(Box::new(ComposableSampler::ParentThreshold)),
+    ])
+}
+
+// Correct the RuleBased implementation in ComposableSampler
+impl GetSamplingIntent for ComposableSampler {
+    fn get_sampling_intent(
+        &self,
+        params: &ComposableParameters<'_>,
+    ) -> SamplingIntent {
+        match self {
+            ComposableSampler::AlwaysOn => SamplingIntent {
+                threshold: Some(ALWAYS_SAMPLE_THRESHOLD),
+            },
+            ComposableSampler::AlwaysOff => SamplingIntent {
+                threshold: None,
+            },
+            ComposableSampler::TraceIdRatio(threshold) => SamplingIntent {
+                threshold: Some(threshold.clone()),
+            },
+            ComposableSampler::ParentThreshold => SamplingIntent {
+                threshold: params.parent_threshold.clone(),
+            },
+            ComposableSampler::RuleBased => {
+                // Note: This needs to be replaced with a proper implementation
+                // that creates and uses a RuleBased instance
+                SamplingIntent {
+                    threshold: Some(NEVER_SAMPLE_THRESHOLD),
+                }
+            },
+        }
+    }
 }
 
 // Tests
@@ -556,7 +667,7 @@ mod tests {
 	assert_eq!(Threshold::from(0.25).to_string(), "c");
 	assert_eq!(Threshold::from(0.01).to_string(), "fd70a");
 	assert_eq!(Threshold::from(MIN_SUPPORTED_PROBABILITY).to_string(), "ffffffffffffff");
-	
+
 	assert_eq!(NEVER_SAMPLE_THRESHOLD.to_string(), "never_sampled");
 	assert_eq!(Threshold(MAX_ADJUSTED_COUNT).to_string(), "never_sampled");
 	assert_eq!(Threshold(u64::MAX).to_string(), "never_sampled");
@@ -664,4 +775,3 @@ mod tests {
 	assert_eq!(Some(Randomness::from_trace_id(tid)), Randomness::from_rv_value("123456789abcde"));
     }
 }
-
