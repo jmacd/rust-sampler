@@ -73,7 +73,9 @@ pub enum ComposableSampler {
     AlwaysOff,
     TraceIdRatio(Threshold),
     ParentThreshold,
-    RuleBased,
+    RuleBased(Vec<RuleAndPredicate>),
+
+    // TODO
     //Annotating,
 }
 
@@ -324,12 +326,18 @@ impl GetSamplingIntent for ComposableSampler {
             ComposableSampler::ParentThreshold => SamplingIntent {
 		threshold: params.parent_threshold.clone(),
 	    },
-            ComposableSampler::RuleBased => SamplingIntent {
-	     	threshold: Some(NEVER_SAMPLE_THRESHOLD),
-	    },
-            // ComposableSampler::Annotating => SamplingIntent {
-	    // 	threshold: None,
-	    // },
+            ComposableSampler::RuleBased(rules) => {
+                // Evaluate rules in order
+                for rule in rules {
+                    if rule.predicate.decide(params) {
+                        return rule.sampler.get_sampling_intent(params);
+                    }
+                }
+                // Default case when no rules match
+                SamplingIntent {
+                    threshold: None,
+                }
+            },
 	}
     }
 }
@@ -539,12 +547,6 @@ pub struct RuleBasedConfig {
     default_rule: Option<Box<dyn GetSamplingIntent>>,
 }
 
-// RuleBased sampler implements rule-based sampling
-#[derive(Clone, Debug)]
-pub struct RuleBased {
-    rules: Vec<RuleAndPredicate>,
-}
-
 // Helper functions to create predicates
 pub fn true_predicate() -> Box<dyn Predicate> {
     Box::new(TruePredicate {})
@@ -588,26 +590,7 @@ pub fn rule_based(options: Vec<RuleBasedOption>) -> ComposableSampler {
         });
     }
 
-    ComposableSampler::RuleBased
-}
-
-// Implement GetSamplingIntent for RuleBased
-impl GetSamplingIntent for RuleBased {
-    fn get_sampling_intent(
-        &self,
-        params: &ComposableParameters<'_>,
-    ) -> SamplingIntent {
-        for rule in &self.rules {
-            if rule.predicate.decide(params) {
-                return rule.sampler.get_sampling_intent(params);
-            }
-        }
-
-        // When no rules match
-        SamplingIntent {
-            threshold: Some(NEVER_SAMPLE_THRESHOLD),
-        }
-    }
+    ComposableSampler::RuleBased(config.rules)
 }
 
 // Create a parent-based composable sampler
@@ -618,37 +601,106 @@ pub fn composable_parent_based(root: Box<dyn GetSamplingIntent>) -> ComposableSa
     ])
 }
 
-// Correct the RuleBased implementation in ComposableSampler
-impl GetSamplingIntent for ComposableSampler {
-    fn get_sampling_intent(
-        &self,
-        params: &ComposableParameters<'_>,
-    ) -> SamplingIntent {
-        match self {
-            ComposableSampler::AlwaysOn => SamplingIntent {
-                threshold: Some(ALWAYS_SAMPLE_THRESHOLD),
-            },
-            ComposableSampler::AlwaysOff => SamplingIntent {
-                threshold: None,
-            },
-            ComposableSampler::TraceIdRatio(threshold) => SamplingIntent {
-                threshold: Some(threshold.clone()),
-            },
-            ComposableSampler::ParentThreshold => SamplingIntent {
-                threshold: params.parent_threshold.clone(),
-            },
-            ComposableSampler::RuleBased => {
-                // Note: This needs to be replaced with a proper implementation
-                // that creates and uses a RuleBased instance
-                SamplingIntent {
-                    threshold: Some(NEVER_SAMPLE_THRESHOLD),
-                }
-            },
-        }
+// A predicate that negates another predicate
+#[derive(Debug, Clone)]
+pub struct NegatedPredicate {
+    original: Box<dyn Predicate>,
+}
+
+impl Predicate for NegatedPredicate {
+    fn decide(&self, params: &ComposableParameters<'_>) -> bool {
+        !self.original.decide(params)
+    }
+
+    fn description(&self) -> String {
+        format!("not({})", self.original.description())
     }
 }
 
-// Tests
+// A predicate that checks if span name matches
+#[derive(Debug, Clone)]
+pub struct SpanNamePredicate {
+    name: String,
+}
+
+impl Predicate for SpanNamePredicate {
+    fn decide(&self, params: &ComposableParameters<'_>) -> bool {
+        self.name == params.params.name
+    }
+
+    fn description(&self) -> String {
+        format!("Span.Name=={}", self.name)
+    }
+}
+
+// A predicate that checks if span kind matches
+#[derive(Debug, Clone)]
+pub struct SpanKindPredicate {
+    kind: SpanKind,
+}
+
+impl Predicate for SpanKindPredicate {
+    fn decide(&self, params: &ComposableParameters<'_>) -> bool {
+        self.kind == *params.params.span_kind
+    }
+
+    fn description(&self) -> String {
+        format!("Span.Kind=={:?}", self.kind)
+    }
+}
+
+// A predicate that checks if the parent context is remote
+#[derive(Debug, Clone)]
+pub struct IsRemotePredicate {}
+
+impl Predicate for IsRemotePredicate {
+    fn decide(&self, params: &ComposableParameters<'_>) -> bool {
+        params.parent_span_context
+            .map(|ctx| ctx.is_remote())
+            .unwrap_or(false)
+    }
+
+    fn description(&self) -> String {
+        "remote?".to_string()
+    }
+}
+
+// A predicate that checks if the parent context is local
+#[derive(Debug, Clone)]
+pub struct IsLocalPredicate {}
+
+impl Predicate for IsLocalPredicate {
+    fn decide(&self, params: &ComposableParameters<'_>) -> bool {
+        params.parent_span_context
+            .map(|ctx| ctx.is_valid() && !ctx.is_remote())
+            .unwrap_or(false)
+    }
+
+    fn description(&self) -> String {
+        "local?".to_string()
+    }
+}
+
+// Helper functions to create predicates
+pub fn negate_predicate(original: Box<dyn Predicate>) -> Box<dyn Predicate> {
+    Box::new(NegatedPredicate { original })
+}
+
+pub fn span_name_predicate(name: String) -> Box<dyn Predicate> {
+    Box::new(SpanNamePredicate { name })
+}
+
+pub fn span_kind_predicate(kind: SpanKind) -> Box<dyn Predicate> {
+    Box::new(SpanKindPredicate { kind })
+}
+
+pub fn is_remote_predicate() -> Box<dyn Predicate> {
+    Box::new(IsRemotePredicate {})
+}
+
+pub fn is_local_predicate() -> Box<dyn Predicate> {
+    Box::new(IsLocalPredicate {})
+}
 
 #[cfg(test)]
 mod tests {
