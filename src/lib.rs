@@ -169,12 +169,28 @@ impl Clone for Box<dyn GetSamplingIntent> {
 // CompositeSampler
 
 impl CompositeSampler {
+    /// Creates a new `CompositeSampler` with the given sampler implementation.
+    ///
+    /// # Arguments
+    /// * `sampler` - The sampling implementation to use for decision making.
     pub fn new(sampler: Box<dyn GetSamplingIntent>) -> Self {
         CompositeSampler { sampler }
     }
 }
 
 impl opentelemetry_sdk::trace::ShouldSample for CompositeSampler {
+    /// Determines whether a span should be sampled.
+    ///
+    /// This is the main entry point from the OpenTelemetry SDK. It evaluates the sampling
+    /// decision based on parent context, trace ID, and other span properties.
+    ///
+    /// # Arguments
+    /// * `parent_context` - The parent context, if any.
+    /// * `trace_id` - The trace ID for the span.
+    /// * `name` - The name of the span.
+    /// * `span_kind` - The kind of span.
+    /// * `attributes` - Initial set of attributes for the span.
+    /// * `links` - Links from this span to other spans.
     fn should_sample(
         &self,
         parent_context: Option<&Context>,
@@ -208,6 +224,11 @@ impl opentelemetry_sdk::trace::ShouldSample for CompositeSampler {
 }
 
 impl CompositeSampler {
+    /// Handles sampling based on parent context.
+    ///
+    /// # Arguments
+    /// * `params` - The sampling parameters.
+    /// * `parent_span_context` - The parent span context, if any.
     fn should_sample_parent(
         &self,
         params: &Parameters<'_>,
@@ -221,6 +242,14 @@ impl CompositeSampler {
         )
     }
 
+    /// Handles sampling with OpenTelemetry trace state information.
+    ///
+    /// Extracts the "ot" field from the trace state, which contains sampling parameters.
+    ///
+    /// # Arguments
+    /// * `params` - The sampling parameters.
+    /// * `parent_span_context` - The parent span context, if any.
+    /// * `otts_str` - The OpenTelemetry trace state string, if present.
     fn should_sample_otts(
         &self,
         params: &Parameters<'_>,
@@ -254,6 +283,17 @@ impl CompositeSampler {
         )
     }
 
+    /// Makes the sampling decision based on randomness and threshold values.
+    ///
+    /// This is the core sampling logic that compares randomness values against thresholds
+    /// and builds the final sampling result.
+    ///
+    /// # Arguments
+    /// * `params` - The sampling parameters.
+    /// * `parent_span_context` - The parent span context, if any.
+    /// * `randomness` - The randomness value to use for sampling decision.
+    /// * `parsed_parent_threshold` - The threshold from the parent, if any.
+    /// * `otts` - The parsed OpenTelemetry trace state, if any.
     fn should_sample_randomness_threshold(
         &self,
         params: &Parameters<'_>,
@@ -331,7 +371,16 @@ impl CompositeSampler {
         }
     }
 
-    // Helper method to update the trace state with the new threshold
+    /// Updates the trace state based on the sampling decision.
+    ///
+    /// Preserves existing trace state values while updating or removing the threshold
+    /// value as needed.
+    ///
+    /// # Arguments
+    /// * `parent_span_context` - The parent span context, if any.
+    /// * `parent_threshold` - The original threshold value from the parent.
+    /// * `intent_threshold` - The threshold value from the sampling decision.
+    /// * `otts` - The parsed OpenTelemetry trace state, if any.
     fn update_trace_state(
         &self,
         parent_span_context: Option<&SpanContext>,
@@ -398,6 +447,9 @@ struct CombinedAttributesProvider {
 }
 
 impl AttributesProvider for CombinedAttributesProvider {
+    /// Gets attributes from multiple providers and combines them.
+    ///
+    /// Returns attributes from both the primary and secondary providers.
     fn get_attributes(&self) -> Vec<KeyValue> {
         let mut result = Vec::new();
         result.extend(self.a.get_attributes());
@@ -409,6 +461,12 @@ impl AttributesProvider for CombinedAttributesProvider {
 // ComposableSampler
 
 impl GetSamplingIntent for ComposableSampler {
+    /// Returns a sampling intent based on the sampler type and parameters.
+    ///
+    /// Different implementations produce different sampling decisions based on their strategy.
+    ///
+    /// # Arguments
+    /// * `params` - The parameters to use for the sampling decision.
     fn get_sampling_intent(&self, params: &ComposableParameters<'_>) -> SamplingIntent {
         match self {
             ComposableSampler::AlwaysOn => SamplingIntent {
@@ -468,10 +526,21 @@ impl GetSamplingIntent for ComposableSampler {
 // Threshold
 
 impl Threshold {
+    /// Creates a new threshold from a sampling probability.
+    ///
+    /// Uses the default sampling precision.
+    ///
+    /// # Arguments
+    /// * `fraction` - The sampling probability (0.0 to 1.0).
     pub fn from(fraction: f64) -> Self {
         Self::from_with_precision(fraction, DEFAULT_SAMPLING_PRECISION)
     }
 
+    /// Creates a new threshold with the specified precision.
+    ///
+    /// # Arguments
+    /// * `fraction` - The sampling probability (0.0 to 1.0).
+    /// * `precision` - The number of hexadecimal digits to use for threshold encoding.
     pub fn from_with_precision(fraction: f64, precision: u32) -> Self {
         if fraction > MAX_SUPPORTED_PROBABILITY {
             return ALWAYS_SAMPLE_THRESHOLD;
@@ -512,7 +581,13 @@ impl Threshold {
         Self(threshold)
     }
 
-    /// Extracts a threshold from an OTel tracestate 'th' value.
+    /// Parses a threshold from a trace state value.
+    ///
+    /// # Arguments
+    /// * `th` - The hexadecimal threshold string.
+    ///
+    /// # Returns
+    /// The parsed threshold or None if invalid.
     pub fn from_th_value(th: &str) -> Option<Self> {
         if th.len() == 0 || th.len() > MAX_SAMPLING_PRECISION as usize {
             None
@@ -524,6 +599,7 @@ impl Threshold {
         }
     }
 
+    /// Converts the threshold to a string representation.
     pub fn to_string(&self) -> String {
         format!("{:?}", self)
     }
@@ -532,7 +608,12 @@ impl Threshold {
 // Randomness
 
 impl Randomness {
-    /// Extracts the least-significant 56 bits of the TraceId.
+    /// Creates randomness from a trace ID.
+    ///
+    /// Uses the least significant bits of the trace ID as a source of randomness.
+    ///
+    /// # Arguments
+    /// * `tid` - The trace ID to extract randomness from.
     pub fn from_trace_id(tid: TraceId) -> Randomness {
         // Note there's no way to access the u128 underneath, otherwise
         // this could be an arithmetic expression,
@@ -546,7 +627,13 @@ impl Randomness {
         ]))
     }
 
-    /// Extracts explicit randomness, expecting exactly 14 hex digits.
+    /// Parses randomness from a trace state value.
+    ///
+    /// # Arguments
+    /// * `rv` - The randomness value as a hexadecimal string.
+    ///
+    /// # Returns
+    /// The parsed randomness or None if invalid.
     pub fn from_rv_value(rv: &str) -> Option<Randomness> {
         // Use explicit randomness.
         if rv.len() != MAX_SAMPLING_PRECISION as usize {
@@ -560,6 +647,7 @@ impl Randomness {
 // fmt::Debug
 
 impl std::fmt::Debug for Randomness {
+    /// Formats randomness as a hexadecimal string.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         let x = MAX_ADJUSTED_COUNT + self.0;
         let xtra = format!("{:x}", x);
@@ -568,6 +656,11 @@ impl std::fmt::Debug for Randomness {
 }
 
 impl std::fmt::Debug for Threshold {
+    /// Formats threshold as a hexadecimal string.
+    ///
+    /// Special cases:
+    /// - 0 is formatted as "0" (always sample)
+    /// - MAX_ADJUSTED_COUNT or higher is formatted as "never_sampled"
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         if self.0 == 0 {
             // 0 is a recognized special case.
@@ -624,10 +717,12 @@ impl Clone for Box<dyn Predicate> {
 pub struct TruePredicate {}
 
 impl Predicate for TruePredicate {
+    /// Always returns true, regardless of parameters.
     fn decide(&self, _params: &ComposableParameters<'_>) -> bool {
         true
     }
 
+    /// Returns a description of this predicate.
     fn description(&self) -> String {
         "true".to_string()
     }
@@ -638,10 +733,12 @@ impl Predicate for TruePredicate {
 pub struct IsRootPredicate {}
 
 impl Predicate for IsRootPredicate {
+    /// Returns true if the span has no parent.
     fn decide(&self, params: &ComposableParameters<'_>) -> bool {
         params.parent_span_context.is_none()
     }
 
+    /// Returns a description of this predicate.
     fn description(&self) -> String {
         "is_root".to_string()
     }
@@ -665,15 +762,24 @@ pub struct RuleBasedConfig {
 }
 
 // Helper functions to create predicates
+
+/// Creates a predicate that always returns true.
 pub fn true_predicate() -> Box<dyn Predicate> {
     Box::new(TruePredicate {})
 }
 
+/// Creates a predicate that returns true for root spans (spans with no parent).
 pub fn is_root_predicate() -> Box<dyn Predicate> {
     Box::new(IsRootPredicate {})
 }
 
 // Configuration options for RuleBased sampler
+
+/// Creates a rule with a predicate and sampler.
+///
+/// # Arguments
+/// * `predicate` - The condition to check.
+/// * `sampler` - The sampler to use when the predicate is true.
 pub fn with_rule(
     predicate: Box<dyn Predicate>,
     sampler: Box<dyn GetSamplingIntent>,
@@ -686,13 +792,20 @@ pub fn with_rule(
     }))
 }
 
+/// Sets the default rule for a rule-based sampler.
+///
+/// # Arguments
+/// * `sampler` - The sampler to use when no other rules match.
 pub fn with_default_rule(sampler: Box<dyn GetSamplingIntent>) -> RuleBasedOption {
     RuleBasedOption(Box::new(move |config: &mut RuleBasedConfig| {
         config.default_rule = Some(sampler.clone());
     }))
 }
 
-// Create a new RuleBased sampler
+/// Creates a rule-based sampler with the specified options.
+///
+/// # Arguments
+/// * `options` - Configuration options for the sampler.
 pub fn rule_based(options: Vec<RuleBasedOption>) -> ComposableSampler {
     let mut config = RuleBasedConfig::default();
 
@@ -710,7 +823,13 @@ pub fn rule_based(options: Vec<RuleBasedOption>) -> ComposableSampler {
     ComposableSampler::RuleBased(config.rules)
 }
 
-// Create a parent-based composable sampler
+/// Creates a parent-based sampler.
+///
+/// Uses the provided sampler for root spans and propagates the parent's
+/// sampling decision for child spans.
+///
+/// # Arguments
+/// * `root` - The sampler to use for root spans.
 pub fn composable_parent_based(root: Box<dyn GetSamplingIntent>) -> ComposableSampler {
     rule_based(vec![
         with_rule(is_root_predicate(), root),
@@ -725,10 +844,12 @@ pub struct NegatedPredicate {
 }
 
 impl Predicate for NegatedPredicate {
+    /// Returns the opposite of the wrapped predicate.
     fn decide(&self, params: &ComposableParameters<'_>) -> bool {
         !self.original.decide(params)
     }
 
+    /// Returns a description of this predicate.
     fn description(&self) -> String {
         format!("not({})", self.original.description())
     }
@@ -741,10 +862,12 @@ pub struct SpanNamePredicate {
 }
 
 impl Predicate for SpanNamePredicate {
+    /// Returns true if the span name matches the expected name.
     fn decide(&self, params: &ComposableParameters<'_>) -> bool {
         self.name == params.params.name
     }
 
+    /// Returns a description of this predicate.
     fn description(&self) -> String {
         format!("Span.Name=={}", self.name)
     }
@@ -757,10 +880,12 @@ pub struct SpanKindPredicate {
 }
 
 impl Predicate for SpanKindPredicate {
+    /// Returns true if the span kind matches the expected kind.
     fn decide(&self, params: &ComposableParameters<'_>) -> bool {
         self.kind == *params.params.span_kind
     }
 
+    /// Returns a description of this predicate.
     fn description(&self) -> String {
         format!("Span.Kind=={:?}", self.kind)
     }
@@ -771,6 +896,7 @@ impl Predicate for SpanKindPredicate {
 pub struct IsRemotePredicate {}
 
 impl Predicate for IsRemotePredicate {
+    /// Returns true if the parent span is remote.
     fn decide(&self, params: &ComposableParameters<'_>) -> bool {
         params
             .parent_span_context
@@ -778,6 +904,7 @@ impl Predicate for IsRemotePredicate {
             .unwrap_or(false)
     }
 
+    /// Returns a description of this predicate.
     fn description(&self) -> String {
         "remote?".to_string()
     }
@@ -788,6 +915,7 @@ impl Predicate for IsRemotePredicate {
 pub struct IsLocalPredicate {}
 
 impl Predicate for IsLocalPredicate {
+    /// Returns true if the parent span is local.
     fn decide(&self, params: &ComposableParameters<'_>) -> bool {
         params
             .parent_span_context
@@ -795,33 +923,53 @@ impl Predicate for IsLocalPredicate {
             .unwrap_or(false)
     }
 
+    /// Returns a description of this predicate.
     fn description(&self) -> String {
         "local?".to_string()
     }
 }
 
-// Helper functions to create predicates
+// More helper functions to create predicates
+
+/// Creates a predicate that negates another predicate.
+///
+/// # Arguments
+/// * `original` - The predicate to negate.
 pub fn negate_predicate(original: Box<dyn Predicate>) -> Box<dyn Predicate> {
     Box::new(NegatedPredicate { original })
 }
 
+/// Creates a predicate that matches spans with a specific name.
+///
+/// # Arguments
+/// * `name` - The span name to match.
 pub fn span_name_predicate(name: String) -> Box<dyn Predicate> {
     Box::new(SpanNamePredicate { name })
 }
 
+/// Creates a predicate that matches spans of a specific kind.
+///
+/// # Arguments
+/// * `kind` - The span kind to match.
 pub fn span_kind_predicate(kind: SpanKind) -> Box<dyn Predicate> {
     Box::new(SpanKindPredicate { kind })
 }
 
+/// Creates a predicate that matches spans with a remote parent.
 pub fn is_remote_predicate() -> Box<dyn Predicate> {
     Box::new(IsRemotePredicate {})
 }
 
+/// Creates a predicate that matches spans with a local parent.
 pub fn is_local_predicate() -> Box<dyn Predicate> {
     Box::new(IsLocalPredicate {})
 }
 
-// Helper function to create an annotating sampler
+/// Creates an annotating sampler that adds attributes to spans.
+///
+/// # Arguments
+/// * `attributes` - The attributes to add to sampled spans.
+/// * `delegate` - The underlying sampler that makes the sampling decision.
 pub fn annotating_sampler(
     attributes: Vec<KeyValue>,
     delegate: Box<dyn GetSamplingIntent>,
@@ -829,7 +977,10 @@ pub fn annotating_sampler(
     ComposableSampler::Annotating(Box::new(StaticAttributesProvider { attributes }), delegate)
 }
 
-// Helper function to create a simple always-on annotating sampler
+/// Creates an always-on sampler that adds attributes to spans.
+///
+/// # Arguments
+/// * `attributes` - The attributes to add to sampled spans.
 pub fn always_on_with_attributes(attributes: Vec<KeyValue>) -> ComposableSampler {
     annotating_sampler(attributes, Box::new(ComposableSampler::AlwaysOn))
 }
