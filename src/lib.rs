@@ -111,6 +111,7 @@ pub enum ComposableSampler {
 /// SamplingIntent is an individual part in a composable decision.
 pub struct SamplingIntent {
     threshold: Option<Threshold>,
+    threshold_reliable: bool,
     attributes_provider: Option<Box<dyn AttributesProvider>>,
 }
 
@@ -130,6 +131,7 @@ pub struct ComposableParameters<'a> {
     params: &'a Parameters<'a>,
     parent_span_context: Option<&'a SpanContext>,
     parent_threshold: Option<Threshold>,
+    parent_threshold_reliable: bool,
 }
 
 /// A CompositeSampler implements the original ShouldSample interface
@@ -303,6 +305,7 @@ impl CompositeSampler {
         otts: Option<&TraceState>,
     ) -> SamplingResult {
         let mut parent_threshold = parsed_parent_threshold.clone();
+	let mut parent_threshold_reliable = false;
 
         let flag_sampled = parent_span_context
             .map(|psc| psc.is_sampled())
@@ -315,6 +318,7 @@ impl CompositeSampler {
             match (threshold_sampled, flag_sampled) {
                 (true, true) => {
                     // The two agree to sample. Threshold is reliable.
+		    parent_threshold_reliable = true;
                 }
                 (true, false) => {
                     // Threshold says sampled, flag says not. The sampler can't
@@ -336,19 +340,20 @@ impl CompositeSampler {
             params,
             parent_span_context,
             parent_threshold,
+	    parent_threshold_reliable,
         };
         let intent = self.sampler.get_sampling_intent(&cparams);
         let threshold = intent.threshold.as_ref();
         let sampled = threshold
             .map(|th| th.0 <= randomness.0)
-            .or(Some(flag_sampled))
+            .or(Some(false)) // if no threshold, same as never-sample
             .unwrap();
 
         // Reassemble the trace state, preserving non-threshold fields.
         let trace_state = self.update_trace_state(
             parent_span_context,
             parsed_parent_threshold,
-            threshold.cloned(),
+            intent.threshold_reliable.then(|| threshold.cloned()).unwrap_or_default(),
             otts,
         );
 
@@ -477,18 +482,22 @@ impl GetSamplingIntent for ComposableSampler {
         match self {
             ComposableSampler::AlwaysOn => SamplingIntent {
                 threshold: Some(ALWAYS_SAMPLE_THRESHOLD),
+		threshold_reliable: true,
                 attributes_provider: None,
             },
             ComposableSampler::AlwaysOff => SamplingIntent {
                 threshold: None,
+		threshold_reliable: false,
                 attributes_provider: None,
             },
             ComposableSampler::TraceIdRatio(threshold) => SamplingIntent {
                 threshold: Some(threshold.clone()),
+		threshold_reliable: true,
                 attributes_provider: None,
             },
             ComposableSampler::ParentThreshold => SamplingIntent {
                 threshold: params.parent_threshold.clone(),
+		threshold_reliable: params.parent_threshold_reliable,
                 attributes_provider: None,
             },
             ComposableSampler::RuleBased(rules) => {
@@ -496,11 +505,12 @@ impl GetSamplingIntent for ComposableSampler {
                 for rule in rules {
                     if rule.predicate.decide(params) {
                         return rule.sampler.get_sampling_intent(params);
-                    }
+		    }
                 }
                 // Default case when no rules match
                 SamplingIntent {
                     threshold: None,
+		    threshold_reliable: false,
                     attributes_provider: None,
                 }
             }
@@ -522,6 +532,7 @@ impl GetSamplingIntent for ComposableSampler {
                 // Use the delegate's threshold
                 SamplingIntent {
                     threshold: delegate_intent.threshold,
+		    threshold_reliable: delegate_intent.threshold_reliable,
                     attributes_provider,
                 }
             }
@@ -1160,7 +1171,6 @@ mod tests {
             (
                 "root span should be sampled with attributes",
                 Context::new(), // No parent context - this is a root span
-                SamplingDecision::RecordAndSample,
                 true, // Should have root attributes
             ),
             (
@@ -1172,7 +1182,6 @@ mod tests {
                     false,
                     TraceState::default(),
                 ))),
-                SamplingDecision::Drop,
                 false, // Should not have root attributes
             ),
             (
@@ -1184,13 +1193,19 @@ mod tests {
                     false,
                     TraceState::default(),
                 ))),
-                SamplingDecision::RecordAndSample,
                 false, // Should not have root attributes
             ),
         ];
 
-        for (name, parent_cx, expected_decision, should_have_root_attributes) in test_cases {
+        for (name, parent_cx, should) in test_cases {
             let trace_id = TraceId::from_u128(1);
+
+	    let expected_decision = if should {
+                SamplingDecision::RecordAndSample
+	    } else {
+	        SamplingDecision::Drop
+	    };
+
             let result = composite_sampler.should_sample(
                 Some(&parent_cx),
                 trace_id,
@@ -1208,7 +1223,7 @@ mod tests {
             );
 
             // Verify root attributes
-            if should_have_root_attributes {
+            if should {
                 assert_eq!(
                     result.attributes, root_attributes,
                     "Root span should have root attributes for test case: {}",
@@ -1229,14 +1244,21 @@ mod tests {
                     name,
                     ot_value
                 );
-            } else if result.decision == SamplingDecision::RecordAndSample {
-                // For sampled non-root spans, they should inherit tracestate from parent
+	    } else {
                 assert!(
                     result.attributes.is_empty(),
-                    "Non-root span should not have root attributes for test case: {}",
+                    "Span should have empty attributes: {}",
                     name
                 );
-            }
+
+                // Verify tracestate does not contain ot=th:0
+                assert!(
+                    result.trace_state.get("ot").is_none(),
+                    "Root span should not have 'ot' in trace state for test case: {}",
+                    name
+                );
+		
+	    }
         }
     }
 }
