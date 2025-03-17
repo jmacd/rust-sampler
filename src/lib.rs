@@ -73,7 +73,7 @@ pub enum ComposableSampler {
     AlwaysOff,
     TraceIdRatio(Threshold),
     ParentThreshold,
-    // RuleBased,
+    RuleBased,
     //Annotating,
 }
 
@@ -324,9 +324,9 @@ impl GetSamplingIntent for ComposableSampler {
             ComposableSampler::ParentThreshold => SamplingIntent {
 		threshold: params.parent_threshold.clone(),
 	    },
-            // ComposableSampler::RuleBased => SamplingIntent {
-	    // 	threshold: None,
-	    // },
+            ComposableSampler::RuleBased => SamplingIntent {
+	     	threshold: Some(),
+	    },
             // ComposableSampler::Annotating => SamplingIntent {
 	    // 	threshold: None,
 	    // },
@@ -467,6 +467,77 @@ impl std::fmt::Debug for Threshold {
 	}
     }    
 }
+
+// RuleBased
+
+func RuleBased(options ...RuleBasedOption) ComposableSampler {
+	rbc := &ruleBasedConfig{}
+	for _, opt := range options {
+		opt(rbc)
+	}
+	if rbc.defRule != nil {
+		rbc.rules = append(rbc.rules, ruleAndPredicate{
+			Predicate:         TruePredicate(),
+			ComposableSampler: rbc.defRule,
+		})
+	}
+	return ruleBased(rbc.rules)
+}
+
+type ruleAndPredicate struct {
+	Predicate
+	ComposableSampler
+}
+
+type ruleBasedConfig struct {
+	rules   []ruleAndPredicate
+	defRule ComposableSampler
+}
+
+type ruleBased []ruleAndPredicate
+
+var _ ComposableSampler = &ruleBased{}
+
+// Description implements ComposableSampler.
+func (rb ruleBased) Description() string {
+	return fmt.Sprintf("RuleBased{%s}",
+		strings.Join(func(rules []ruleAndPredicate) (desc []string) {
+			for _, rule := range rules {
+				desc = append(desc,
+					fmt.Sprintf("rule(%s)=%s",
+						rule.Predicate.Description(),
+						rule.ComposableSampler.Description(),
+					),
+				)
+			}
+			return
+		}(rb), ","))
+}
+
+// GetSamplingIntent implements ComposableSampler.
+func (rb ruleBased) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
+	for _, rule := range rb {
+		if rule.Decide(params) {
+			return rule.ComposableSampler.GetSamplingIntent(params)
+		}
+	}
+
+	// When no rules match.  This will not happen when there is a
+	// default rule set.
+	return SamplingIntent{
+		Threshold: NEVER_SAMPLE_THRESHOLD,
+	}
+}
+
+// ComposableParentBased combines a root sampler and a ParentThreshold.
+func ComposableParentBased(root ComposableSampler) ComposableSampler {
+	return RuleBased(
+		WithRule(IsRootPredicate(), root),
+		WithDefaultRule(ParentThreshold()),
+	)
+}
+
+// Tests
 
 #[cfg(test)]
 mod tests {
