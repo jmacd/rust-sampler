@@ -279,7 +279,7 @@ impl CompositeSampler {
             parent_span_context,
             randomness,
             threshold,
-            otts.as_ref()
+            otts.as_ref(),
         )
     }
 
@@ -338,10 +338,10 @@ impl CompositeSampler {
             parent_threshold,
         };
         let intent = self.sampler.get_sampling_intent(&cparams);
-	let threshold = intent.threshold.as_ref();
+        let threshold = intent.threshold.as_ref();
         let sampled = threshold
             .map(|th| th.0 <= randomness.0)
-            .or(Some(false))
+            .or(Some(flag_sampled))
             .unwrap();
 
         // Reassemble the trace state, preserving non-threshold fields.
@@ -360,7 +360,11 @@ impl CompositeSampler {
 
         // Compute the attributes.
         let attributes = sampled
-            .then(|| intent.attributes_provider.map(|provider| provider.get_attributes()))
+            .then(|| {
+                intent
+                    .attributes_provider
+                    .map(|provider| provider.get_attributes())
+            })
             .flatten()
             .unwrap_or_default();
 
@@ -434,7 +438,9 @@ impl CompositeSampler {
             base_trace_state.delete("ot").unwrap_or(base_trace_state)
         } else {
             // Otherwise update the OT tracestate value.
-            base_trace_state.insert("ot", new_otts_str).unwrap_or(base_trace_state)
+            base_trace_state
+                .insert("ot", new_otts_str)
+                .unwrap_or(base_trace_state)
         }
     }
 }
@@ -988,6 +994,9 @@ pub fn always_on_with_attributes(attributes: Vec<KeyValue>) -> ComposableSampler
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::testing::trace::TestSpan;
+    use opentelemetry::trace::{SpanContext, SpanId, TraceFlags};
+    use opentelemetry_sdk::trace::ShouldSample;
 
     // Note: this package makes testing threshold encodings natural.
     // because both use hexadecimal encoding.
@@ -1131,5 +1140,103 @@ mod tests {
             Some(Randomness::from_trace_id(tid)),
             Randomness::from_rv_value("123456789abcde")
         );
+    }
+
+    #[test]
+    fn parent_sampler() {
+        // Create a root sampler that adds test attributes
+        let root_attributes = vec![KeyValue::new("root.sampled", true)];
+        let root_sampler = annotating_sampler(
+            root_attributes.clone(),
+            Box::new(ComposableSampler::AlwaysOn),
+        );
+
+        // Create a parent-based composable sampler with our root sampler
+        let sampler = composable_parent_based(Box::new(root_sampler));
+        let composite_sampler = CompositeSampler::new(Box::new(sampler));
+
+        // Test cases: name, parent context, expected decision, should have root attributes
+        let test_cases = vec![
+            (
+                "root span should be sampled with attributes",
+                Context::new(), // No parent context - this is a root span
+                SamplingDecision::RecordAndSample,
+                true, // Should have root attributes
+            ),
+            (
+                "child of non-sampled span should not be sampled",
+                Context::current_with_span(TestSpan(SpanContext::new(
+                    TraceId::from_u128(1),
+                    SpanId::from_u64(1),
+                    TraceFlags::default(), // not sampled
+                    false,
+                    TraceState::default(),
+                ))),
+                SamplingDecision::Drop,
+                false, // Should not have root attributes
+            ),
+            (
+                "child of sampled span should be sampled without attributes",
+                Context::current_with_span(TestSpan(SpanContext::new(
+                    TraceId::from_u128(1),
+                    SpanId::from_u64(1),
+                    TraceFlags::SAMPLED, // sampled
+                    false,
+                    TraceState::default(),
+                ))),
+                SamplingDecision::RecordAndSample,
+                false, // Should not have root attributes
+            ),
+        ];
+
+        for (name, parent_cx, expected_decision, should_have_root_attributes) in test_cases {
+            let trace_id = TraceId::from_u128(1);
+            let result = composite_sampler.should_sample(
+                Some(&parent_cx),
+                trace_id,
+                name,
+                &SpanKind::Internal,
+                &[],
+                &[],
+            );
+
+            // Verify decision
+            assert_eq!(
+                result.decision, expected_decision,
+                "Unexpected decision for test case: {}",
+                name
+            );
+
+            // Verify root attributes
+            if should_have_root_attributes {
+                assert_eq!(
+                    result.attributes, root_attributes,
+                    "Root span should have root attributes for test case: {}",
+                    name
+                );
+
+                // Verify tracestate contains ot=th:0 for root spans
+                assert!(
+                    result.trace_state.get("ot").is_some(),
+                    "Root span should have 'ot' in trace state for test case: {}",
+                    name
+                );
+
+                let ot_value = result.trace_state.get("ot").unwrap();
+                assert!(
+                    ot_value.contains("th:0"),
+                    "TraceState 'ot' value should contain 'th:0' for test case: {}, got: {}",
+                    name,
+                    ot_value
+                );
+            } else if result.decision == SamplingDecision::RecordAndSample {
+                // For sampled non-root spans, they should inherit tracestate from parent
+                assert!(
+                    result.attributes.is_empty(),
+                    "Non-root span should not have root attributes for test case: {}",
+                    name
+                );
+            }
+        }
     }
 }
