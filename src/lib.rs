@@ -245,7 +245,13 @@ impl CompositeSampler {
 
         let threshold = th_value.map(|th| Threshold::from_th_value(th)).flatten();
 
-        self.should_sample_randomness_threshold(params, parent_span_context, randomness, threshold)
+        self.should_sample_randomness_threshold(
+            params,
+            parent_span_context,
+            randomness,
+            threshold,
+            otts.as_ref()
+        )
     }
 
     fn should_sample_randomness_threshold(
@@ -253,41 +259,37 @@ impl CompositeSampler {
         params: &Parameters<'_>,
         parent_span_context: Option<&SpanContext>,
         randomness: Randomness,
-        mut parent_threshold: Option<Threshold>,
+        parsed_parent_threshold: Option<Threshold>,
+        otts: Option<&TraceState>,
     ) -> SamplingResult {
-        let mut update_trace_flag = false;
-        let mut erase_threshold = false;
-        let mut threshold_reliable = false;
+        let mut parent_threshold = parsed_parent_threshold.clone();
 
         let flag_sampled = parent_span_context
             .map(|psc| psc.is_sampled())
             .or_else(|| Some(false))
             .unwrap();
 
-        if let Some(parent_threshold) = parent_threshold.as_ref() {
-            let threshold_sampled = parent_threshold.0 <= randomness.0;
+        if let Some(pt) = parent_threshold.as_ref() {
+            let threshold_sampled = pt.0 <= randomness.0;
 
             match (threshold_sampled, flag_sampled) {
                 (true, true) => {
-                    // The two agree to sample.  Threshold is reliable.
-                    threshold_reliable = true;
+                    // The two agree to sample. Threshold is reliable.
                 }
                 (true, false) => {
-                    // Threshold says sampled, flag says not.
-                    update_trace_flag = true;
+                    // Threshold says sampled, flag says not. The sampler can't
+                    // modify trace flags, therefore erase the threshold.
+                    parent_threshold = None;
                 }
                 (false, true) => {
-                    // Flag says sampled, threshold says not.  The threshold should not propagate.
-                    erase_threshold = true;
+                    // Flag says sampled, threshold says not. The threshold should not propagate.
+                    parent_threshold = None;
                 }
                 (false, false) => {
-                    // The two agree not to sample.  The threshold should not propagate.
-                    erase_threshold = true;
+                    // The two agree not to sample. The threshold should not propagate.
+                    parent_threshold = None;
                 }
             }
-        }
-        if !threshold_reliable {
-            parent_threshold = None;
         }
 
         let cparams = ComposableParameters {
@@ -296,15 +298,19 @@ impl CompositeSampler {
             parent_threshold,
         };
         let intent = self.sampler.get_sampling_intent(&cparams);
-
-        let sampled = intent
-            .threshold
+	let threshold = intent.threshold.as_ref();
+        let sampled = threshold
             .map(|th| th.0 <= randomness.0)
             .or(Some(false))
             .unwrap();
 
-        // TODO: recombine tracestate; evaluate attributes funcs.
-        (_, _) = (update_trace_flag, erase_threshold);
+        // Reassemble the trace state, preserving non-threshold fields.
+        let trace_state = self.update_trace_state(
+            parent_span_context,
+            parsed_parent_threshold,
+            threshold.cloned(),
+            otts,
+        );
 
         let decision = if sampled {
             SamplingDecision::RecordAndSample
@@ -312,20 +318,74 @@ impl CompositeSampler {
             SamplingDecision::Drop
         };
 
-        // Only collect attributes if we're sampling this span
-
-        let attributes = sampled.then().then();
-
-	//     if sampled && intent.attributes_provider.is_some() {
-        //     intent.attributes_provider.get_attributes()
-        // } else {
-        //     vec![]
-        // };
+        // Compute the attributes.
+        let attributes = sampled
+            .then(|| intent.attributes_provider.map(|provider| provider.get_attributes()))
+            .flatten()
+            .unwrap_or_default();
 
         SamplingResult {
-            decision: decision,
+            decision,
             attributes,
-            trace_state: TraceState::default(),
+            trace_state,
+        }
+    }
+
+    // Helper method to update the trace state with the new threshold
+    fn update_trace_state(
+        &self,
+        parent_span_context: Option<&SpanContext>,
+        parent_threshold: Option<Threshold>,
+        intent_threshold: Option<Threshold>,
+        otts: Option<&TraceState>,
+    ) -> TraceState {
+        // Quick exit if thresholds match - no change needed
+        if parent_threshold == intent_threshold {
+            return parent_span_context
+                .map(|ctx| ctx.trace_state())
+                .cloned()
+                .unwrap_or_default();
+        }
+
+        // If we have no OTel trace state and intent threshold is None, nothing to do
+        if otts.is_none() && intent_threshold.is_none() {
+            return parent_span_context
+                .map(|ctx| ctx.trace_state())
+                .cloned()
+                .unwrap_or_default();
+        }
+
+        // Get base trace state from parent
+        let base_trace_state = parent_span_context
+            .map(|ctx| ctx.trace_state())
+            .cloned()
+            .unwrap_or_default();
+
+        // Create a new OTel trace state, starting with existing fields if any
+        let mut new_otts = otts.cloned().unwrap_or_default();
+
+        // Update the threshold in the OTel trace state
+        match intent_threshold {
+            Some(threshold) => {
+                // Add or update the threshold
+                let th_str = threshold.to_string();
+                new_otts = new_otts.insert("th", th_str).unwrap_or(new_otts);
+            }
+            None => {
+                // Remove the threshold
+                new_otts = new_otts.delete("th").unwrap_or(new_otts);
+            }
+        }
+
+        // Use header_delimited to format the OTel trace state
+        let new_otts_str = new_otts.header_delimited(":", ";");
+
+        if new_otts_str.is_empty() {
+            // If no fields are left, remove the OT entry from the trace state
+            base_trace_state.delete("ot").unwrap_or(base_trace_state)
+        } else {
+            // Otherwise update the OT tracestate value.
+            base_trace_state.insert("ot", new_otts_str).unwrap_or(base_trace_state)
         }
     }
 }
