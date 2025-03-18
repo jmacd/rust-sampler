@@ -847,11 +847,22 @@ pub fn rule_based(options: Vec<RuleBasedOption>) -> ComposableSampler {
 ///
 /// # Arguments
 /// * `root` - The sampler to use for root spans.
-pub fn composable_parent_based(root: Box<dyn GetSamplingIntent>) -> ComposableSampler {
+pub fn parent_based(root: Box<dyn GetSamplingIntent>) -> ComposableSampler {
     rule_based(vec![
         with_rule(is_root_predicate(), root),
         with_default_rule(Box::new(ComposableSampler::ParentThreshold)),
     ])
+}
+
+/// Creates a ratio-based sampler.
+///
+/// Uses the provided sampler for root spans and propagates the parent's
+/// sampling decision for child spans.
+///
+/// # Arguments
+/// * `root` - The sampler to use for root spans.
+pub fn ratio_based(prob: f64) -> ComposableSampler {
+    ComposableSampler::TraceIdRatio(Threshold::from(prob))
 }
 
 // A predicate that negates another predicate
@@ -1163,18 +1174,28 @@ mod tests {
         );
 
         // Create a parent-based composable sampler with our root sampler
-        let sampler = composable_parent_based(Box::new(root_sampler));
-        let composite_sampler = CompositeSampler::new(Box::new(sampler));
+        let parent_sampler = parent_based(Box::new(root_sampler));
+        let alternate_attributes = vec![KeyValue::new("alternate.sampled", true)];
+	let alternate_sampler = annotating_sampler(alternate_attributes.clone(), Box::new(ratio_based(0.5)));
+	let composable_sampler = rule_based(vec![
+	    with_rule(span_name_predicate("special".to_string()), Box::new(alternate_sampler)),
+	    with_default_rule(Box::new(parent_sampler)),
+	]);
+        let composite_sampler = CompositeSampler::new(Box::new(composable_sampler));
 
         // Test cases: name, parent context, expected decision, should have root attributes
         let test_cases = vec![
             (
                 "root span should be sampled with attributes",
+		"normal",
                 Context::new(), // No parent context - this is a root span
-                true, // Should have root attributes
+		root_attributes.clone(),
+                TraceState::from_key_value(vec![("ot", "th:0")]).unwrap(),
+                true,
             ),
             (
                 "child of non-sampled span should not be sampled",
+		"normal",
                 Context::current_with_span(TestSpan(SpanContext::new(
                     TraceId::from_u128(1),
                     SpanId::from_u64(1),
@@ -1182,10 +1203,13 @@ mod tests {
                     false,
                     TraceState::default(),
                 ))),
-                false, // Should not have root attributes
+		vec![],
+                TraceState::default(),
+                false,
             ),
             (
-                "child of sampled span should be sampled without attributes",
+                "child of sampled span should be sampled without tracestate",
+		"normal",
                 Context::current_with_span(TestSpan(SpanContext::new(
                     TraceId::from_u128(1),
                     SpanId::from_u64(1),
@@ -1193,14 +1217,45 @@ mod tests {
                     false,
                     TraceState::default(),
                 ))),
-                false, // Should not have root attributes
+		vec![],
+                TraceState::default(),
+                false,
+            ),
+            (
+                "child of sampled span should be sampled with randomness",
+		"normal",
+                Context::current_with_span(TestSpan(SpanContext::new(
+                    TraceId::from_u128(1),
+                    SpanId::from_u64(1),
+                    TraceFlags::SAMPLED, // sampled
+                    false,
+                    TraceState::from_key_value(vec![("ot", "rv:ababababababab")]).unwrap(),
+                ))),
+		vec![],
+                TraceState::from_key_value(vec![("ot", "rv:ababababababab")]).unwrap(),
+                false,
+            ),
+            (
+                "child of sampled span should be sampled with special name @ 50%",
+		"special",
+                Context::current_with_span(TestSpan(SpanContext::new(
+                    TraceId::from_u128(1),
+                    SpanId::from_u64(1),
+                    TraceFlags::SAMPLED, // sampled
+                    false,
+                    TraceState::from_key_value(vec![("ot", "rv:ababababababab")]).unwrap(),
+                    ))),
+		vec![KeyValue::new("alternate.sampled", true)],
+		// Note the order of keys (th, rv) is arbitrary.
+                TraceState::from_key_value(vec![("ot", "th:8;rv:ababababababab")]).unwrap(),
+                true,
             ),
         ];
 
-        for (name, parent_cx, should) in test_cases {
+        for (name, span_name, parent_cx, expect_attrs, expect_tracestate, should) in test_cases {
             let trace_id = TraceId::from_u128(1);
 
-	    let expected_decision = if should {
+	    let expect_decision = if should {
                 SamplingDecision::RecordAndSample
 	    } else {
 	        SamplingDecision::Drop
@@ -1209,7 +1264,7 @@ mod tests {
             let result = composite_sampler.should_sample(
                 Some(&parent_cx),
                 trace_id,
-                name,
+                span_name,
                 &SpanKind::Internal,
                 &[],
                 &[],
@@ -1217,48 +1272,24 @@ mod tests {
 
             // Verify decision
             assert_eq!(
-                result.decision, expected_decision,
+                result.decision, expect_decision,
                 "Unexpected decision for test case: {}",
                 name
             );
 
-            // Verify root attributes
-            if should {
-                assert_eq!(
-                    result.attributes, root_attributes,
-                    "Root span should have root attributes for test case: {}",
-                    name
+            // Verify attributes
+            assert_eq!(
+                result.attributes, expect_attrs,
+                    "Sspan should have expected attributes for test case: {}",
+                name,
                 );
 
-                // Verify tracestate contains ot=th:0 for root spans
-                assert!(
-                    result.trace_state.get("ot").is_some(),
-                    "Root span should have 'ot' in trace state for test case: {}",
-                    name
+            // Verify tracestate
+            assert_eq!(
+                result.trace_state, expect_tracestate,
+                    "Sspan should have expected attributes for test case: {}",
+                name,
                 );
-
-                let ot_value = result.trace_state.get("ot").unwrap();
-                assert!(
-                    ot_value.contains("th:0"),
-                    "TraceState 'ot' value should contain 'th:0' for test case: {}, got: {}",
-                    name,
-                    ot_value
-                );
-	    } else {
-                assert!(
-                    result.attributes.is_empty(),
-                    "Span should have empty attributes: {}",
-                    name
-                );
-
-                // Verify tracestate does not contain ot=th:0
-                assert!(
-                    result.trace_state.get("ot").is_none(),
-                    "Root span should not have 'ot' in trace state for test case: {}",
-                    name
-                );
-		
-	    }
         }
     }
 }
