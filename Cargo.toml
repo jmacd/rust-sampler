@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-opentelemetry = "0.28.0"
-opentelemetry-stdout = "0.28.0"
-opentelemetry_sdk = "0.28.0"
+opentelemetry = { version = "0.28.0", path = "../rust/opentelemetry", features = ["testing"]}
+opentelemetry-stdout = { version = "0.28.0", path = "../rust/opentelemetry-stdout" }
+opentelemetry_sdk = { version = "0.28.0", path = "../rust/opentelemetry-sdk" }
+
+[dev-dependencies]
 tokio = { version = "1.44.1", features = ["full"] }
 tokio-tracing = "0.0.0"
+hexf = "0.2.1"
