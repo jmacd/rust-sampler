@@ -305,7 +305,7 @@ impl CompositeSampler {
         otts: Option<&TraceState>,
     ) -> SamplingResult {
         let mut parent_threshold = parsed_parent_threshold.clone();
-	let mut parent_threshold_reliable = false;
+        let mut parent_threshold_reliable = false;
 
         let flag_sampled = parent_span_context
             .map(|psc| psc.is_sampled())
@@ -318,7 +318,7 @@ impl CompositeSampler {
             match (threshold_sampled, flag_sampled) {
                 (true, true) => {
                     // The two agree to sample. Threshold is reliable.
-		    parent_threshold_reliable = true;
+                    parent_threshold_reliable = true;
                 }
                 (true, false) => {
                     // Threshold says sampled, flag says not. The sampler can't
@@ -340,7 +340,7 @@ impl CompositeSampler {
             params,
             parent_span_context,
             parent_threshold,
-	    parent_threshold_reliable,
+            parent_threshold_reliable,
         };
         let intent = self.sampler.get_sampling_intent(&cparams);
         let threshold = intent.threshold.as_ref();
@@ -353,7 +353,10 @@ impl CompositeSampler {
         let trace_state = self.update_trace_state(
             parent_span_context,
             parsed_parent_threshold,
-            intent.threshold_reliable.then(|| threshold.cloned()).unwrap_or_default(),
+            intent
+                .threshold_reliable
+                .then(|| threshold.cloned())
+                .unwrap_or_default(),
             otts,
         );
 
@@ -482,22 +485,22 @@ impl GetSamplingIntent for ComposableSampler {
         match self {
             ComposableSampler::AlwaysOn => SamplingIntent {
                 threshold: Some(ALWAYS_SAMPLE_THRESHOLD),
-		threshold_reliable: true,
+                threshold_reliable: true,
                 attributes_provider: None,
             },
             ComposableSampler::AlwaysOff => SamplingIntent {
                 threshold: None,
-		threshold_reliable: false,
+                threshold_reliable: false,
                 attributes_provider: None,
             },
             ComposableSampler::TraceIdRatio(threshold) => SamplingIntent {
                 threshold: Some(threshold.clone()),
-		threshold_reliable: true,
+                threshold_reliable: true,
                 attributes_provider: None,
             },
             ComposableSampler::ParentThreshold => SamplingIntent {
                 threshold: params.parent_threshold.clone(),
-		threshold_reliable: params.parent_threshold_reliable,
+                threshold_reliable: params.parent_threshold_reliable,
                 attributes_provider: None,
             },
             ComposableSampler::RuleBased(rules) => {
@@ -505,12 +508,12 @@ impl GetSamplingIntent for ComposableSampler {
                 for rule in rules {
                     if rule.predicate.decide(params) {
                         return rule.sampler.get_sampling_intent(params);
-		    }
+                    }
                 }
                 // Default case when no rules match
                 SamplingIntent {
                     threshold: None,
-		    threshold_reliable: false,
+                    threshold_reliable: false,
                     attributes_provider: None,
                 }
             }
@@ -532,7 +535,7 @@ impl GetSamplingIntent for ComposableSampler {
                 // Use the delegate's threshold
                 SamplingIntent {
                     threshold: delegate_intent.threshold,
-		    threshold_reliable: delegate_intent.threshold_reliable,
+                    threshold_reliable: delegate_intent.threshold_reliable,
                     attributes_provider,
                 }
             }
@@ -1176,26 +1179,30 @@ mod tests {
         // Create a parent-based composable sampler with our root sampler
         let parent_sampler = parent_based(Box::new(root_sampler));
         let alternate_attributes = vec![KeyValue::new("alternate.sampled", true)];
-	let alternate_sampler = annotating_sampler(alternate_attributes.clone(), Box::new(ratio_based(0.5)));
-	let composable_sampler = rule_based(vec![
-	    with_rule(span_name_predicate("special".to_string()), Box::new(alternate_sampler)),
-	    with_default_rule(Box::new(parent_sampler)),
-	]);
+        let alternate_sampler =
+            annotating_sampler(alternate_attributes.clone(), Box::new(ratio_based(0.5)));
+        let composable_sampler = rule_based(vec![
+            with_rule(
+                span_name_predicate("special".to_string()),
+                Box::new(alternate_sampler),
+            ),
+            with_default_rule(Box::new(parent_sampler)),
+        ]);
         let composite_sampler = CompositeSampler::new(Box::new(composable_sampler));
 
         // Test cases: name, parent context, expected decision, should have root attributes
         let test_cases = vec![
             (
                 "root span should be sampled with attributes",
-		"normal",
+                "normal",
                 Context::new(), // No parent context - this is a root span
-		root_attributes.clone(),
+                root_attributes.clone(),
                 TraceState::from_key_value(vec![("ot", "th:0")]).unwrap(),
                 true,
             ),
             (
                 "child of non-sampled span should not be sampled",
-		"normal",
+                "normal",
                 Context::current_with_span(TestSpan(SpanContext::new(
                     TraceId::from_u128(1),
                     SpanId::from_u64(1),
@@ -1203,13 +1210,13 @@ mod tests {
                     false,
                     TraceState::default(),
                 ))),
-		vec![],
+                vec![],
                 TraceState::default(),
                 false,
             ),
             (
                 "child of sampled span should be sampled without tracestate",
-		"normal",
+                "normal",
                 Context::current_with_span(TestSpan(SpanContext::new(
                     TraceId::from_u128(1),
                     SpanId::from_u64(1),
@@ -1217,13 +1224,13 @@ mod tests {
                     false,
                     TraceState::default(),
                 ))),
-		vec![],
+                vec![],
                 TraceState::default(),
                 false,
             ),
             (
                 "child of sampled span should be sampled with randomness",
-		"normal",
+                "normal",
                 Context::current_with_span(TestSpan(SpanContext::new(
                     TraceId::from_u128(1),
                     SpanId::from_u64(1),
@@ -1231,22 +1238,22 @@ mod tests {
                     false,
                     TraceState::from_key_value(vec![("ot", "rv:ababababababab")]).unwrap(),
                 ))),
-		vec![],
+                vec![],
                 TraceState::from_key_value(vec![("ot", "rv:ababababababab")]).unwrap(),
                 false,
             ),
             (
                 "child of sampled span should be sampled with special name @ 50%",
-		"special",
+                "special",
                 Context::current_with_span(TestSpan(SpanContext::new(
                     TraceId::from_u128(1),
                     SpanId::from_u64(1),
                     TraceFlags::SAMPLED, // sampled
                     false,
                     TraceState::from_key_value(vec![("ot", "rv:ababababababab")]).unwrap(),
-                    ))),
-		vec![KeyValue::new("alternate.sampled", true)],
-		// Note the order of keys (th, rv) is arbitrary.
+                ))),
+                vec![KeyValue::new("alternate.sampled", true)],
+                // Note the order of keys (th, rv) is arbitrary.
                 TraceState::from_key_value(vec![("ot", "th:8;rv:ababababababab")]).unwrap(),
                 true,
             ),
@@ -1255,11 +1262,11 @@ mod tests {
         for (name, span_name, parent_cx, expect_attrs, expect_tracestate, should) in test_cases {
             let trace_id = TraceId::from_u128(1);
 
-	    let expect_decision = if should {
+            let expect_decision = if should {
                 SamplingDecision::RecordAndSample
-	    } else {
-	        SamplingDecision::Drop
-	    };
+            } else {
+                SamplingDecision::Drop
+            };
 
             let result = composite_sampler.should_sample(
                 Some(&parent_cx),
@@ -1280,16 +1287,16 @@ mod tests {
             // Verify attributes
             assert_eq!(
                 result.attributes, expect_attrs,
-                    "Sspan should have expected attributes for test case: {}",
+                "Sspan should have expected attributes for test case: {}",
                 name,
-                );
+            );
 
             // Verify tracestate
             assert_eq!(
                 result.trace_state, expect_tracestate,
-                    "Sspan should have expected attributes for test case: {}",
+                "Sspan should have expected attributes for test case: {}",
                 name,
-                );
+            );
         }
     }
 }
