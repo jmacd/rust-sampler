@@ -103,7 +103,7 @@ pub enum ComposableSampler {
     AlwaysOn,
     AlwaysOff,
     TraceIdRatio(Threshold),
-    ParentThreshold,
+    ParentThreshold(Box<dyn GetSamplingIntent>),
     RuleBased(Vec<RuleAndPredicate>),
     Annotating(Box<dyn AttributesProvider>, Box<dyn GetSamplingIntent>),
 }
@@ -498,11 +498,17 @@ impl GetSamplingIntent for ComposableSampler {
                 threshold_reliable: true,
                 attributes_provider: None,
             },
-            ComposableSampler::ParentThreshold => SamplingIntent {
-                threshold: params.parent_threshold.clone(),
-                threshold_reliable: params.parent_threshold_reliable,
-                attributes_provider: None,
-            },
+            ComposableSampler::ParentThreshold(root) => {
+		if params.parent_span_context.is_none() {
+		    root.get_sampling_intent(params)
+		} else {
+		    SamplingIntent {
+			threshold: params.parent_threshold.clone(),
+			threshold_reliable: params.parent_threshold_reliable,
+			attributes_provider: None,
+		    }
+		}
+	    },
             ComposableSampler::RuleBased(rules) => {
                 // Evaluate rules in order
                 for rule in rules {
@@ -851,10 +857,7 @@ pub fn rule_based(options: Vec<RuleBasedOption>) -> ComposableSampler {
 /// # Arguments
 /// * `root` - The sampler to use for root spans.
 pub fn parent_based(root: Box<dyn GetSamplingIntent>) -> ComposableSampler {
-    rule_based(vec![
-        with_rule(is_root_predicate(), root),
-        with_default_rule(Box::new(ComposableSampler::ParentThreshold)),
-    ])
+    ComposableSampler::ParentThreshold(root)
 }
 
 /// Creates a ratio-based sampler.
