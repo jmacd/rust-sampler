@@ -10,6 +10,8 @@ use opentelemetry::{
     Context, KeyValue,
 };
 
+pub mod ratelimit;
+
 // OTEP 235 constants
 
 /// DefaultSamplingPrecision is the number of hexadecimal
